@@ -19,47 +19,103 @@ import './altair.scss';
 import { useLiveAPIContext } from "../../contexts/LiveAPIContext";
 import { ToolCall } from "../../multimodal-live-types";
 
-// Define the function declaration for the Discovery Engine search tool
-const search_discovery_engine: FunctionDeclaration = {
-  name: "search_discovery_engine",
-  description:
-    "Searches the Traveloka hotel database using Google Discovery Engine based on a user query.",
-  parameters: {
-    type: SchemaType.OBJECT,
-    properties: {
-      query: {
-        type: SchemaType.STRING,
-        description: "The search term or query to use for finding hotels.",
-      },
-    },
-    required: ["query"],
-  },
+// Function to safely parse the tool definition from environment variable
+const getSearchToolDefinition = (): FunctionDeclaration | null => {
+  const definitionString = process.env.REACT_APP_SEARCH_HOTEL_TOOL_DEFINITION;
+  if (!definitionString) {
+    console.error("REACT_APP_SEARCH_HOTEL_TOOL_DEFINITION is not set in .env");
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(definitionString);
+    // Manually map string types back to SchemaType enums
+    const mapSchemaType = (typeString: string): SchemaType => {
+        switch (typeString) {
+            case "OBJECT": return SchemaType.OBJECT;
+            case "STRING": return SchemaType.STRING;
+            // Add other types as needed
+            default: throw new Error(`Unsupported SchemaType string: ${typeString}`);
+        }
+    };
+
+    return {
+        ...parsed,
+        parameters: {
+            ...parsed.parameters,
+            type: mapSchemaType(parsed.parameters.type),
+            properties: {
+                ...parsed.parameters.properties,
+                query: {
+                    ...parsed.parameters.properties.query,
+                    type: mapSchemaType(parsed.parameters.properties.query.type),
+                }
+            }
+        }
+    } as FunctionDeclaration; // Assert type after mapping
+  } catch (error) {
+    console.error("Failed to parse REACT_APP_SEARCH_HOTEL_TOOL_DEFINITION:", error);
+    return null;
+  }
 };
 
 function AltairComponent() {
   const { client, setConfig } = useLiveAPIContext();
   const [hotelResults, setHotelResults] = useState<any[] | null>(null);
+  const [searchToolDefinition, setSearchToolDefinition] = useState<FunctionDeclaration | null>(null);
+  const [toolConfigError, setToolConfigError] = useState<string | null>(null);
 
-  // Configure the Live API client with the Discovery Engine tool
+  // Load and configure the Live API client with the Discovery Engine tool from .env
   useEffect(() => {
+    const definition = getSearchToolDefinition();
+    const toolUrl = process.env.REACT_APP_SEARCH_HOTEL_TOOL_URL;
+
+    if (!definition) {
+        setToolConfigError("Search tool definition is missing or invalid in .env.");
+        return;
+    }
+    if (!toolUrl) {
+        setToolConfigError("Search tool URL (REACT_APP_SEARCH_HOTEL_TOOL_URL) is missing in .env.");
+        return;
+    }
+    setSearchToolDefinition(definition); // Store definition for later use in tool call handler
+    setToolConfigError(null); // Clear any previous error
+
+    // Safely parse generation config from env, providing a default if missing/invalid
+    let generationConfig = {};
+    try {
+      generationConfig = JSON.parse(process.env.REACT_APP_GENERATION_CONFIG || '{}');
+    } catch (error) {
+      console.error("Failed to parse REACT_APP_GENERATION_CONFIG:", error, "Using default empty config.");
+      setToolConfigError((prev) => (prev ? prev + "\n" : "") + "Invalid Generation Config in .env.");
+    }
+
+    // Read model name and system instructions from env, providing defaults
+    const modelName = process.env.REACT_APP_MODEL_NAME || "models/gemini-2.0-flash-exp"; // Default model
+    const systemInstructionsText = process.env.REACT_APP_SYSTEM_INSTRUCTIONS || 'You are a helpful travel assistant.'; // Default instructions
+
+    if (!process.env.REACT_APP_MODEL_NAME) {
+        console.warn("REACT_APP_MODEL_NAME not set in .env, using default.");
+        setToolConfigError((prev) => (prev ? prev + "\n" : "") + "Model Name not set in .env.");
+    }
+    if (!process.env.REACT_APP_SYSTEM_INSTRUCTIONS) {
+        console.warn("REACT_APP_SYSTEM_INSTRUCTIONS not set in .env, using default.");
+        setToolConfigError((prev) => (prev ? prev + "\n" : "") + "System Instructions not set in .env.");
+    }
+
+
     setConfig({
-      model: "models/gemini-2.0-flash-exp", // Or your preferred model
-      generationConfig: {
-        responseModalities: "audio", // Or your preferred modality
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } }, // Or your preferred voice
-        },
-      },
+      model: modelName,
+      generationConfig: generationConfig,
       systemInstruction: {
         parts: [
           {
-            text: 'You are a helpful travel assistant. When asked to search for hotels, use the "search_discovery_engine" function.',
+            text: systemInstructionsText,
           },
         ],
       },
       tools: [
         // Include the Discovery Engine function declaration
-        { functionDeclarations: [search_discovery_engine] },
+        { functionDeclarations: [definition] }, // Use definition from env
         // You can include other tools like Google Search if needed
         { googleSearch: {} },
       ],
@@ -73,10 +129,11 @@ function AltairComponent() {
 
       // Find the specific function call for Discovery Engine search
       const call = toolCall.functionCalls.find(
-        (fc) => fc.name === search_discovery_engine.name,
+        (fc) => fc.name === searchToolDefinition?.name, // Use definition from state
       );
 
-      if (call) {
+      // Ensure definition is loaded before processing tool call
+      if (call && searchToolDefinition) {
         console.log(`Executing function call: ${call.name}`);
         const { query } = call.args as { query: string };
 
@@ -122,8 +179,18 @@ function AltairComponent() {
           },
         };
 
-        const apiUrl =
-          "https://discoveryengine.googleapis.com/v1alpha/projects/1018963165306/locations/global/collections/default_collection/engines/traveloka-augmented-search_1746094176671/servingConfigs/default_search:search";
+        const apiUrl = process.env.REACT_APP_SEARCH_HOTEL_TOOL_URL;
+
+        // --- Error Handling: Check for missing URL (already checked in config effect, but double-check) ---
+        if (!apiUrl) {
+            console.error("REACT_APP_SEARCH_HOTEL_TOOL_URL is missing in .env.");
+            const errorResponse = {
+                error: "Configuration Error",
+                message: "Search tool URL is missing. Please check the .env file.",
+            };
+            client.sendToolResponse({ functionResponses: [{ id: call.id, response: errorResponse }] });
+            return; // Stop execution if URL is missing
+        }
 
         try {
           // --- Make the API call ---
@@ -179,10 +246,15 @@ function AltairComponent() {
     return () => {
       client.off("toolcall", onToolCall);
     };
-  }, [client]); // Removed sendToolResponse dependency
+  }, [client, setConfig, searchToolDefinition]); // Add searchToolDefinition dependency
 
   // This component no longer renders anything directly.
   // Gemini will handle the response based on the tool results.
+  // Display configuration error if present
+  if (toolConfigError) {
+      return <div className="error-message">Configuration Error: {toolConfigError}</div>;
+  }
+
   return (
     <>
       {/* Existing UI elements would go here if there were any */}
